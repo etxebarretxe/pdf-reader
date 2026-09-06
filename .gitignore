@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+*.build/
+*.dist/
+*.onefile-build/
+main.build/
+main.dist/
+config/settings.json
