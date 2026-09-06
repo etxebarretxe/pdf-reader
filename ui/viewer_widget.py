@@ -170,6 +170,8 @@ class ViewerWidget(QGraphicsView):
     page_changed = Signal(int)
     zoom_changed = Signal(float)
     selection_changed = Signal(bool)
+    note_point_picked = Signal(int, float, float)          # pagina, x, y
+    context_requested = Signal(int, float, float, object)  # pagina, x, y, pos global
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -192,6 +194,7 @@ class ViewerWidget(QGraphicsView):
         self._single_page = 0
         self._words_cache: Dict[int, list] = {}
         self._drag_origin: Optional[Tuple[int, float, float]] = None
+        self.note_mode = False
         self._panning = False
         self._pan_anchor = QPointF()
 
@@ -539,7 +542,33 @@ class ViewerWidget(QGraphicsView):
                 return item
         return None
 
+    def set_note_mode(self, enabled: bool) -> None:
+        self.note_mode = enabled
+        if enabled:
+            self.viewport().setCursor(Qt.CrossCursor)
+        else:
+            self.viewport().unsetCursor()
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        scene_pos = self.mapToScene(event.pos())
+        item = self._item_at(scene_pos)
+        if item is None:
+            super().contextMenuEvent(event)
+            return
+        page_x, page_y = item.unmap_point(scene_pos - item.pos())
+        self.context_requested.emit(item.index, page_x, page_y, event.globalPos())
+        event.accept()
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton and self.note_mode:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            item = self._item_at(scene_pos)
+            self.set_note_mode(False)
+            if item is not None:
+                page_x, page_y = item.unmap_point(scene_pos - item.pos())
+                self.note_point_picked.emit(item.index, page_x, page_y)
+                event.accept()
+                return
         if event.button() == Qt.LeftButton:
             scene_pos = self.mapToScene(event.position().toPoint())
             item = self._item_at(scene_pos)

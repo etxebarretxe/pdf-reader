@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from typing import List, Optional
 
-from PySide6.QtCore import QEvent, QSettings, Qt, QTimer
+from PySide6.QtCore import QEvent, QSettings, Qt, QThreadPool, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -19,9 +19,11 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
 )
 
+from core import annotations
 from core.document import DocumentError, PdfDocument
 from core.search import SearchController
 from ui import theme
@@ -81,6 +83,16 @@ class MainWindow(QMainWindow):
         self.thumb_dock.setFeatures(QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetMovable)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.thumb_dock)
         self.thumb_dock.hide()
+
+        self.save_pool = QThreadPool(self)
+        self.save_pool.setMaxThreadCount(1)
+        self._dirty = False
+        self._saving = False
+        self._read_only = False
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(1200)
+        self._save_timer.timeout.connect(self.save_annotations)
 
         self.search = SearchController(self)
         self.search_bar = SearchBar(self.viewer)
@@ -147,6 +159,31 @@ class MainWindow(QMainWindow):
         self.action_find_prev = self._act("Buscar anterior", None, QKeySequence.FindPrevious)
         self.action_theme = self._act("Tema claro / oscuro", "theme", "Ctrl+D", "Cambiar tema (Ctrl+D)")
 
+        self.action_highlight = self._act(
+            "Resaltar seleccion", "highlight", "H", "Resaltar el texto seleccionado (H)"
+        )
+        self.action_underline = self._act(
+            "Subrayar seleccion", "underline", "U", "Subrayar el texto seleccionado (U)"
+        )
+        self.action_strikeout = self._act(
+            "Tachar seleccion", "strike", "T", "Tachar el texto seleccionado (T)"
+        )
+        self.action_note = self._act(
+            "Nota adhesiva", "note", "N", "Colocar una nota en la pagina (N)"
+        )
+        self.action_save = self._act(
+            "Guardar anotaciones", None, QKeySequence.Save, "Guardar las anotaciones en el PDF (Ctrl+S)"
+        )
+        self.action_copy = self._act("Copiar texto seleccionado", None, QKeySequence.Copy)
+        self.annotation_actions = [
+            self.action_highlight, self.action_underline,
+            self.action_strikeout, self.action_note,
+        ]
+
+        # Color activo de cada tipo de marca.
+        self.highlight_color = annotations.HIGHLIGHT_COLORS[0][1]
+        self.line_color = annotations.LINE_COLORS[0][1]
+
     def _create_menus(self) -> None:
         menubar = self.menuBar()
 
@@ -179,6 +216,23 @@ class MainWindow(QMainWindow):
         go_menu.addAction(self.action_first)
         go_menu.addAction(self.action_last)
         go_menu.addAction(self.action_goto)
+
+        annot_menu = menubar.addMenu("&Anotar")
+        annot_menu.addAction(self.action_highlight)
+        annot_menu.addMenu(self._color_menu(
+            "Color de resaltado", annotations.HIGHLIGHT_COLORS, self._set_highlight_color
+        ))
+        annot_menu.addSeparator()
+        annot_menu.addAction(self.action_underline)
+        annot_menu.addAction(self.action_strikeout)
+        annot_menu.addMenu(self._color_menu(
+            "Color de linea", annotations.LINE_COLORS, self._set_line_color
+        ))
+        annot_menu.addSeparator()
+        annot_menu.addAction(self.action_note)
+        annot_menu.addSeparator()
+        annot_menu.addAction(self.action_copy)
+        annot_menu.addAction(self.action_save)
 
         self.menu_search = menubar.addMenu("&Buscar")
         self.menu_search.addAction(self.action_search)
@@ -218,6 +272,19 @@ class MainWindow(QMainWindow):
         self.action_continuous.triggered.connect(lambda: self.set_view_mode(VIEW_CONTINUOUS))
         self.action_single.triggered.connect(lambda: self.set_view_mode(VIEW_SINGLE))
         self.action_theme.triggered.connect(self.toggle_theme)
+
+        self.action_highlight.triggered.connect(
+            lambda: self.annotate(annotations.HIGHLIGHT))
+        self.action_underline.triggered.connect(
+            lambda: self.annotate(annotations.UNDERLINE))
+        self.action_strikeout.triggered.connect(
+            lambda: self.annotate(annotations.STRIKEOUT))
+        self.action_note.triggered.connect(self.on_add_note)
+        self.action_save.triggered.connect(self.save_annotations)
+        self.action_copy.triggered.connect(self.on_copy)
+        self.viewer.note_point_picked.connect(self.on_note_point)
+        self.viewer.context_requested.connect(self.on_context_menu)
+        self.viewer.selection_changed.connect(self.on_selection_changed)
 
         self.action_search.triggered.connect(self.on_search)
         self.action_find_next.triggered.connect(self.on_find_next)
@@ -283,15 +350,23 @@ class MainWindow(QMainWindow):
         self.document = document
         self.viewer.set_document(document)
         self.thumbnails.set_document(document)
-        self.setWindowTitle(f"{document.filename} - {APP_NAME}")
+        self._read_only = not annotations.is_writable(document.path)
+        self._dirty = False
+        self._update_title()
         self.page_spin.setRange(1, document.page_count)
         self.page_total.setText(f" / {document.page_count}")
         self._update_enabled_state()
+        self.on_selection_changed(False)
+        if self._read_only:
+            self.statusBar().showMessage(
+                "Archivo de solo lectura: no se podran guardar anotaciones", 6000
+            )
         self.on_page_changed(0)
         self.on_zoom_changed(self.viewer.zoom)
         return True
 
     def _release_document(self) -> None:
+        self._save_timer.stop()
         self.search.cancel()
         self._current_match = None
         self.search_bar.hide()
@@ -309,11 +384,12 @@ class MainWindow(QMainWindow):
             self.action_zoom_reset, self.action_fit_width, self.action_fit_page,
             self.action_rotate_left, self.action_rotate_right, self.action_search,
             self.action_thumbnails, self.action_continuous, self.action_single,
-            self.action_find_next, self.action_find_prev,
+            self.action_find_next, self.action_find_prev, self.action_copy,
         ):
             action.setEnabled(has_doc)
         for action in getattr(self, "annotation_actions", []):
-            action.setEnabled(has_doc)
+            action.setEnabled(has_doc and not self._read_only)
+        self.action_save.setEnabled(has_doc and not self._read_only)
         self.page_spin.setEnabled(has_doc)
         self.zoom_combo.setEnabled(has_doc)
         if not has_doc:
@@ -373,6 +449,217 @@ class MainWindow(QMainWindow):
         )
         if ok:
             self.viewer.goto_page(value - 1)
+
+    # ------------------------------------------------------------ anotaciones
+
+    def _color_menu(self, title: str, colors, setter) -> QMenu:
+        menu = QMenu(title, self)
+        for name, value in colors:
+            action = menu.addAction(name)
+            action.setCheckable(True)
+            action.setData(value)
+            action.triggered.connect(lambda _checked=False, v=value, m=menu: setter(v, m))
+        menu.actions()[0].setChecked(True)
+        return menu
+
+    def _set_highlight_color(self, value, menu: QMenu) -> None:
+        self.highlight_color = value
+        for action in menu.actions():
+            action.setChecked(action.data() == value)
+
+    def _set_line_color(self, value, menu: QMenu) -> None:
+        self.line_color = value
+        for action in menu.actions():
+            action.setChecked(action.data() == value)
+
+    def on_selection_changed(self, has_selection: bool) -> None:
+        enabled = has_selection and self.document is not None and not self._read_only
+        for action in (self.action_highlight, self.action_underline, self.action_strikeout):
+            action.setEnabled(enabled)
+        self.action_copy.setEnabled(has_selection)
+
+    def on_copy(self) -> None:
+        if self.viewer.has_selection():
+            QApplication.clipboard().setText(self.viewer.selection.text)
+            self.statusBar().showMessage("Texto copiado al portapapeles", 2000)
+
+    def _check_writable(self) -> bool:
+        if self.document is None:
+            return False
+        if self._read_only:
+            QMessageBox.information(
+                self, APP_NAME,
+                "El archivo es de solo lectura, no se pueden guardar anotaciones en el.",
+            )
+            return False
+        return True
+
+    def annotate(self, kind: str) -> None:
+        if not self.viewer.has_selection() or not self._check_writable():
+            return
+        selection = self.viewer.selection
+        color = self.highlight_color if kind == annotations.HIGHLIGHT else self.line_color
+        try:
+            annotations.add_text_markup(
+                self.document, selection.page_index, selection.rects, kind, color,
+                author=self.author_name,
+            )
+        except annotations.AnnotationError as exc:
+            QMessageBox.warning(self, APP_NAME, f"No se ha podido anotar:\n{exc}")
+            return
+        page = selection.page_index
+        self.viewer.clear_selection()
+        self.viewer.refresh_page(page)
+        self.mark_dirty()
+
+    def on_add_note(self) -> None:
+        if not self._check_writable():
+            return
+        self.viewer.set_note_mode(True)
+        self.statusBar().showMessage(
+            "Haz clic en el punto de la pagina donde quieres colocar la nota", 6000
+        )
+
+    def on_note_point(self, page_index: int, x: float, y: float) -> None:
+        if not self._check_writable():
+            return
+        text, ok = QInputDialog.getMultiLineText(self, "Nota adhesiva", "Texto de la nota:")
+        if not ok or not text.strip():
+            return
+        try:
+            annotations.add_note(self.document, page_index, (x, y), text, self.author_name)
+        except annotations.AnnotationError as exc:
+            QMessageBox.warning(self, APP_NAME, f"No se ha podido crear la nota:\n{exc}")
+            return
+        self.viewer.refresh_page(page_index)
+        self.mark_dirty()
+
+    def on_context_menu(self, page_index: int, x: float, y: float, global_pos) -> None:
+        if self.document is None:
+            return
+        menu = QMenu(self)
+        if self.viewer.has_selection():
+            menu.addAction(self.action_highlight)
+            menu.addAction(self.action_underline)
+            menu.addAction(self.action_strikeout)
+            menu.addAction(self.action_copy)
+            menu.addSeparator()
+        menu.addAction(self.action_note)
+
+        found = annotations.annotation_at(self.document, page_index, x, y)
+        if found is not None and not self._read_only:
+            xref, kind, content = found
+            menu.addSeparator()
+            if kind == "Text":
+                edit = menu.addAction("Editar nota...")
+                edit.triggered.connect(
+                    lambda _checked=False: self._edit_note(page_index, xref, content)
+                )
+            delete = menu.addAction("Eliminar anotacion")
+            delete.triggered.connect(
+                lambda _checked=False: self._delete_annotation(page_index, xref)
+            )
+        menu.exec(global_pos)
+
+    def _edit_note(self, page_index: int, xref: int, content: str) -> None:
+        text, ok = QInputDialog.getMultiLineText(self, "Editar nota", "Texto de la nota:", content)
+        if not ok:
+            return
+        annotations.update_note(self.document, page_index, xref, text)
+        self.viewer.refresh_page(page_index)
+        self.mark_dirty()
+
+    def _delete_annotation(self, page_index: int, xref: int) -> None:
+        if annotations.delete_annotation(self.document, page_index, xref):
+            self.viewer.refresh_page(page_index)
+            self.mark_dirty()
+
+    # ------------------------------------------------------------- guardado
+
+    @property
+    def author_name(self) -> str:
+        return str(self.settings.value("author", "")) or ""
+
+    def mark_dirty(self) -> None:
+        self._dirty = True
+        self._update_title()
+        self._save_timer.start()
+
+    def _update_title(self) -> None:
+        if self.document is None:
+            self.setWindowTitle(APP_NAME)
+            return
+        mark = " *" if self._dirty else ""
+        suffix = "  [solo lectura]" if self._read_only else ""
+        self.setWindowTitle(f"{self.document.filename}{mark}{suffix} - {APP_NAME}")
+
+    def save_annotations(self) -> None:
+        if self.document is None or not self._dirty or self._saving or self._read_only:
+            return
+        self._saving = True
+        self._save_timer.stop()
+        self.statusBar().showMessage("Guardando anotaciones...", 2000)
+        task = annotations.SaveTask(self.document)
+        task.signals.done.connect(self._on_saved, Qt.QueuedConnection)
+        task.signals.failed.connect(self._on_save_failed, Qt.QueuedConnection)
+        self.save_pool.start(task)
+
+    def _on_saved(self, incremental: bool, temp_path: str) -> None:
+        self._saving = False
+        self._dirty = False
+        if not incremental and temp_path:
+            self._finish_full_save(temp_path)
+        self._update_title()
+        self.statusBar().showMessage("Anotaciones guardadas en el PDF", 3000)
+
+    def _on_save_failed(self, message: str) -> None:
+        self._saving = False
+        QMessageBox.warning(
+            self, APP_NAME, f"No se han podido guardar las anotaciones:\n{message}"
+        )
+
+    def _finish_full_save(self, temp_path: str) -> None:
+        """Documento sin guardado incremental: se sustituye y se reabre."""
+        if self.document is None:
+            return
+        path = self.document.path
+        page = self.viewer.current_page()
+        zoom, zoom_mode = self.viewer.zoom, self.viewer.zoom_mode
+        rotation = self.viewer.rotation
+        self._release_document()
+        try:
+            annotations.replace_with_temp(path, temp_path)
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"No se ha podido guardar:\n{exc}")
+        self.open_path(path)
+        self.viewer.rotation = rotation
+        self.viewer.set_zoom(zoom, zoom_mode)
+        self.viewer.goto_page(page)
+
+    def _save_before_close(self) -> None:
+        """Guardado sincrono al cerrar (incremental: milisegundos)."""
+        if self.document is None or not self._dirty or self._read_only:
+            return
+        try:
+            with self.document.lock:
+                if self.document.raw.can_save_incrementally():
+                    self.document.raw.save(
+                        self.document.path, incremental=True,
+                        encryption=annotations.pymupdf.PDF_ENCRYPT_KEEP,
+                    )
+                    self._dirty = False
+                    return
+                temp_path = self.document.path + ".lectorpdf.tmp"
+                self.document.raw.save(temp_path, garbage=3, deflate=True)
+            path = self.document.path
+            self.document.close()
+            self.document = None
+            annotations.replace_with_temp(path, temp_path)
+            self._dirty = False
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                self, APP_NAME, f"No se han podido guardar las anotaciones:\n{exc}"
+            )
 
     # --------------------------------------------------------------- busqueda
 
@@ -506,6 +793,9 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------------- cierre
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._save_timer.stop()
+        self.save_pool.waitForDone(5000)
+        self._save_before_close()
         self.search.shutdown()
         self.thumbnails.shutdown()
         self._release_document()

@@ -15,6 +15,11 @@ incluye lo que se usa (ver, navegar, buscar, anotar).
   hilo secundario (la UI nunca se bloquea), resaltado progresivo de todas las
   coincidencias, navegacion entre resultados con contador "3 de 27" y
   cancelacion inmediata al reescribir el termino.
+- **Fase 3 — Anotaciones (completa):** resaltado (5 colores), subrayado,
+  tachado y notas adhesivas, con menu contextual para editar o eliminar. Las
+  anotaciones se escriben **dentro del propio PDF** en formato estandar, con
+  guardado incremental en hilo secundario (milisegundos, sin reescribir el
+  fichero completo).
 
 ## Requisitos
 
@@ -44,6 +49,11 @@ python main.py documento.pdf   # abre un documento
 | `Ctrl+F` | Buscar |
 | `F3` / `Mayus+F3` | Coincidencia siguiente / anterior |
 | `Esc` | Cerrar la busqueda |
+| `H` | Resaltar la seleccion |
+| `U` / `T` | Subrayar / tachar la seleccion |
+| `N` | Colocar una nota adhesiva |
+| `Ctrl+C` | Copiar el texto seleccionado |
+| `Ctrl+S` | Guardar anotaciones en el PDF |
 | `F4` | Panel de miniaturas |
 | `Ctrl+D` | Tema claro / oscuro |
 | `Ctrl+rueda` | Zoom con el raton |
@@ -65,3 +75,15 @@ Reglas de rendimiento que sigue el codigo:
 - La matriz de PyMuPDF se multiplica por el `devicePixelRatio` de la pantalla
   para que el texto sea nitido con escalado de Windows al 125/150/200%.
 - El acceso al documento esta serializado con un lock (MuPDF no es thread-safe).
+- Las anotaciones se guardan con `doc.save(..., incremental=True,
+  encryption=PDF_ENCRYPT_KEEP)` cuando `can_save_incrementally()` lo permite;
+  si no, guardado completo, tambien en segundo plano.
+
+## Anotaciones
+
+Seleccion de texto arrastrando con el raton (doble clic selecciona una
+palabra) y despues `H`, `U` o `T`. El boton derecho abre el menu contextual
+para anotar, editar una nota o eliminar la anotacion que este bajo el cursor.
+Los cambios se guardan solos 1,2 s despues de la ultima anotacion, con
+`Ctrl+S`, y al cerrar la ventana. Si el archivo es de solo lectura la
+aplicacion lo indica y desactiva las anotaciones.
