@@ -153,7 +153,14 @@ def delete_annotation(document: PdfDocument, page_index: int, xref: int) -> bool
             del page
 
 
-class _SaveSignals(QObject):
+class SaveSignals(QObject):
+    """Senales del guardado.
+
+    Las crea y conserva la ventana, no la tarea: un ``QRunnable`` con
+    ``autoDelete`` se destruye al terminar y arrastraria consigo una emision
+    en cola aun sin procesar por el hilo GUI.
+    """
+
     done = Signal(bool, str)   # (incremental, ruta temporal si fue completo)
     failed = Signal(str)
 
@@ -161,10 +168,10 @@ class _SaveSignals(QObject):
 class SaveTask(QRunnable):
     """Guarda las anotaciones en el PDF desde un hilo secundario."""
 
-    def __init__(self, document: PdfDocument) -> None:
+    def __init__(self, document: PdfDocument, signals: SaveSignals) -> None:
         super().__init__()
         self.setAutoDelete(True)
-        self.signals = _SaveSignals()
+        self._signals = signals
         self._document = document
 
     def run(self) -> None:  # pragma: no cover - se ejecuta en el pool
@@ -180,16 +187,16 @@ class SaveTask(QRunnable):
                         incremental=True,
                         encryption=pymupdf.PDF_ENCRYPT_KEEP,
                     )
-                    self.signals.done.emit(True, "")
+                    self._signals.done.emit(True, "")
                     return
                 # El documento no admite guardado incremental (p. ej. venia
                 # danado y MuPDF lo reparo al abrirlo): guardado completo a un
                 # temporal; el reemplazo lo hace la UI tras cerrar el handle.
                 temp_path = document.path + ".lectorpdf.tmp"
                 document.raw.save(temp_path, garbage=3, deflate=True)
-            self.signals.done.emit(False, temp_path)
+            self._signals.done.emit(False, temp_path)
         except Exception as exc:  # noqa: BLE001 - se informa en la UI
-            self.signals.failed.emit(str(exc))
+            self._signals.failed.emit(str(exc))
 
 
 def replace_with_temp(path: str, temp_path: str) -> None:

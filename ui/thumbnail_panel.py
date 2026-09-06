@@ -20,7 +20,10 @@ THUMB_WIDTH = 116
 
 
 class _ThumbSignals(QObject):
+    """Senales del panel (no de cada tarea: los QRunnable se autodestruyen)."""
+
     done = Signal(int, QImage)
+    failed = Signal(int)
 
 
 class _ThumbTask(QRunnable):
@@ -31,19 +34,23 @@ class _ThumbTask(QRunnable):
         self._document = document
         self._index = index
         self._generation = generation
-        self.signals = _ThumbSignals()
 
     def run(self) -> None:  # pragma: no cover - se ejecuta en el pool
+        signals = self._panel.signals
         if not self._panel.is_current(self._generation):
+            signals.failed.emit(self._index)
             return
         width_pt, _ = self._document.page_size(self._index)
         zoom = THUMB_WIDTH / max(1.0, width_pt)
         try:
             image = render_page_image(self._document, self._index, zoom)
         except Exception:  # noqa: BLE001 - una miniatura fallida no es critica
+            signals.failed.emit(self._index)
             return
-        if image is not None and self._panel.is_current(self._generation):
-            self.signals.done.emit(self._index, image)
+        if image is None or not self._panel.is_current(self._generation):
+            signals.failed.emit(self._index)
+            return
+        signals.done.emit(self._index, image)
 
 
 class ThumbnailPanel(QListWidget):
@@ -59,6 +66,9 @@ class ThumbnailPanel(QListWidget):
         self._generation = 0
         self._syncing = False
 
+        self.signals = _ThumbSignals(self)
+        self.signals.done.connect(self._on_thumb, Qt.QueuedConnection)
+        self.signals.failed.connect(self._pending.discard, Qt.QueuedConnection)
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(1)
 
@@ -131,9 +141,7 @@ class ThumbnailPanel(QListWidget):
             if index in self._loaded or index in self._pending:
                 continue
             self._pending.add(index)
-            task = _ThumbTask(self, self.document, index, self._generation)
-            task.signals.done.connect(self._on_thumb, Qt.QueuedConnection)
-            self._pool.start(task)
+            self._pool.start(_ThumbTask(self, self.document, index, self._generation))
 
     def _on_thumb(self, index: int, image: QImage) -> None:
         self._pending.discard(index)

@@ -15,7 +15,6 @@ cientos de paginas congelaria la interfaz varios segundos. Se ejecuta en un
 from __future__ import annotations
 
 import threading
-from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
@@ -29,17 +28,24 @@ _BATCH_PAGES = 4
 
 
 class _SearchSignals(QObject):
-    batch = Signal(object)          # {pagina: [rect, ...]}
-    finished = Signal(int, bool)    # (paginas escaneadas, completada)
+    """Senales del controlador (no de cada tarea: los QRunnable mueren al
+    terminar y una emision en cola podria perderse con ellos). El primer
+    argumento es el token de la busqueda, para descartar resultados de una
+    busqueda ya cancelada."""
+
+    batch = Signal(int, object)          # (token, {pagina: [rect, ...]})
+    finished = Signal(int, int, bool)    # (token, paginas escaneadas, completada)
 
 
 class SearchTask(QRunnable):
     """Escaneo completo del documento en segundo plano."""
 
-    def __init__(self, path: str, term: str, page_count: int, start_page: int = 0) -> None:
+    def __init__(self, signals: "_SearchSignals", token: int, path: str, term: str,
+                 page_count: int, start_page: int = 0) -> None:
         super().__init__()
         self.setAutoDelete(True)
-        self.signals = _SearchSignals()
+        self._signals = signals
+        self._token = token
         self._path = path
         self._term = term
         self._page_count = page_count
@@ -77,16 +83,16 @@ class SearchTask(QRunnable):
                 if hits:
                     batch[index] = [(r.x0, r.y0, r.x1, r.y1) for r in hits]
                 if batch and (position % _BATCH_PAGES == 0):
-                    self.signals.batch.emit(batch)
+                    self._signals.batch.emit(self._token, batch)
                     batch = {}
             if batch and not self._cancel.is_set():
-                self.signals.batch.emit(batch)
+                self._signals.batch.emit(self._token, batch)
         except Exception:  # noqa: BLE001 - un fallo de busqueda no rompe la UI
             pass
         finally:
             if document is not None:
                 document.close()
-            self.signals.finished.emit(scanned, not self._cancel.is_set())
+            self._signals.finished.emit(self._token, scanned, not self._cancel.is_set())
 
 
 class SearchController(QObject):
@@ -100,6 +106,10 @@ class SearchController(QObject):
         super().__init__(parent)
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(1)
+        self._signals = _SearchSignals(self)
+        self._signals.batch.connect(self._on_batch, Qt.QueuedConnection)
+        self._signals.finished.connect(self._on_finished, Qt.QueuedConnection)
+        self._token = 0
         self._task: Optional[SearchTask] = None
         self.term = ""
         self.matches: Dict[int, List[Rect]] = {}
@@ -116,11 +126,8 @@ class SearchController(QObject):
             self.matches_updated.emit(self.matches)
             self.finished.emit(0)
             return
-        task = SearchTask(path, term, page_count, start_page)
-        # Las senales llevan la tarea emisora: los resultados de una busqueda
-        # ya cancelada se descartan al llegar.
-        task.signals.batch.connect(partial(self._on_batch, task), Qt.QueuedConnection)
-        task.signals.finished.connect(partial(self._on_finished, task), Qt.QueuedConnection)
+        self._token += 1
+        task = SearchTask(self._signals, self._token, path, term, page_count, start_page)
         self._task = task
         self._pool.start(task)
 
@@ -128,6 +135,7 @@ class SearchController(QObject):
         if self._task is not None:
             self._task.cancel()
             self._task = None
+        self._token += 1  # invalida los resultados que lleguen con retraso
 
     def shutdown(self) -> None:
         self.cancel()
@@ -135,8 +143,8 @@ class SearchController(QObject):
 
     # --------------------------------------------------------------- ranuras
 
-    def _on_batch(self, task: SearchTask, batch: Dict[int, List[Rect]]) -> None:
-        if task is not self._task:
+    def _on_batch(self, token: int, batch: Dict[int, List[Rect]]) -> None:
+        if token != self._token or self._task is None:
             return
         for index, rects in batch.items():
             self.matches.setdefault(index, []).extend(rects)
@@ -144,8 +152,8 @@ class SearchController(QObject):
         self.matches_updated.emit(self.matches)
         self.progress.emit(len(self.ordered), len(self.matches))
 
-    def _on_finished(self, task: SearchTask, _scanned: int, completed: bool) -> None:
-        if task is not self._task:
+    def _on_finished(self, token: int, _scanned: int, completed: bool) -> None:
+        if token != self._token:
             return
         if completed:
             self._task = None

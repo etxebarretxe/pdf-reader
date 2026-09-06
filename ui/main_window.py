@@ -115,6 +115,9 @@ class MainWindow(QMainWindow):
 
         self.save_pool = QThreadPool(self)
         self.save_pool.setMaxThreadCount(1)
+        self.save_signals = annotations.SaveSignals(self)
+        self.save_signals.done.connect(self._on_saved, Qt.QueuedConnection)
+        self.save_signals.failed.connect(self._on_save_failed, Qt.QueuedConnection)
         self._dirty = False
         self._saving = False
         self._read_only = False
@@ -639,10 +642,7 @@ class MainWindow(QMainWindow):
         self._saving = True
         self._save_timer.stop()
         self.statusBar().showMessage("Guardando anotaciones...", 2000)
-        task = annotations.SaveTask(self.document)
-        task.signals.done.connect(self._on_saved, Qt.QueuedConnection)
-        task.signals.failed.connect(self._on_save_failed, Qt.QueuedConnection)
-        self.save_pool.start(task)
+        self.save_pool.start(annotations.SaveTask(self.document, self.save_signals))
 
     def _on_saved(self, incremental: bool, temp_path: str) -> None:
         self._saving = False

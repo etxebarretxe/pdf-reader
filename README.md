@@ -173,11 +173,14 @@ El instalador ofrece (desmarcada por defecto) la asociacion de la extension
 `.pdf`. El tamano en disco ronda los 80-150 MB, que es lo normal con Qt +
 PyMuPDF; lo que importa es la RAM en ejecucion, no el peso del instalador.
 
-> Los valores de `--noinclude-qt-plugins` son **categorias de plugins de Qt**
-> (los subdirectorios de `PySide6/plugins`), no modulos como QtWebEngine, y sus
-> nombres han cambiado entre versiones. La lista del script esta comprobada
-> contra PySide6 6.11; si una version futura rechaza algun nombre, Nuitka
-> imprime la lista valida y puedes compilar mientras tanto con
+> Los valores de `--noinclude-qt-plugins` son **familias de plugins de Qt**
+> (los subdirectorios de `PySide6/plugins`), no modulos como QtWebEngine.
+> Comprobado contra Nuitka 4.2.1 y PySide6 6.11: Nuitka parte de un conjunto
+> "sensible" y esta opcion solo descarta elementos de el, ignorando sin error
+> los nombres que no existan (la validacion estricta la hace
+> `--include-qt-plugins`). Los modulos Qt no usados se excluyen aparte con
+> `--nofollow-import-to`. Si una version futura cambia los nombres, se pueden
+> revisar con `nuitka --help-plugins` o compilar con
 > `python packaging\build_windows.py --no-exclude-plugins`.
 
 ## Funciones deliberadamente excluidas

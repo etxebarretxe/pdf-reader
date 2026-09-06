@@ -65,8 +65,17 @@ def render_page_image(
 
 
 class _RenderSignals(QObject):
+    """Senales del renderizado.
+
+    Vive en el motor, no en cada tarea: un ``QRunnable`` con ``autoDelete`` se
+    destruye en cuanto termina ``run()``, y si las senales colgaran de el, una
+    emision en cola podria perderse al recolectarse el objeto antes de que el
+    hilo GUI la procese.
+    """
+
     done = Signal(object, QImage)  # (CacheKey, imagen)
     failed = Signal(object, str)
+    aborted = Signal(object)
 
 
 class RenderTask(QRunnable):
@@ -78,14 +87,14 @@ class RenderTask(QRunnable):
         self._engine = engine
         self._key = key
         self._generation = generation
-        self.signals = _RenderSignals()
 
     def run(self) -> None:  # pragma: no cover - se ejecuta en el pool
+        signals = self._engine.signals
         index, zoom_m, rotation, dpr_c = self._key
         # Abortar si el usuario ya ha hecho scroll/zoom y esta pagina ya no
         # se necesita: evita saturar el QThreadPool con trabajo obsoleto.
         if not self._engine.is_wanted(index, self._generation):
-            self._engine.task_finished(self._key)
+            signals.aborted.emit(self._key)
             return
         try:
             image = render_page_image(
@@ -96,13 +105,12 @@ class RenderTask(QRunnable):
                 dpr_c / 100.0,
             )
         except Exception as exc:  # noqa: BLE001 - se informa a la UI
-            self._engine.task_finished(self._key)
-            self.signals.failed.emit(self._key, str(exc))
+            signals.failed.emit(self._key, str(exc))
             return
         if image is None or not self._engine.is_wanted(index, self._generation):
-            self._engine.task_finished(self._key)
+            signals.aborted.emit(self._key)
             return
-        self.signals.done.emit(self._key, image)
+        signals.done.emit(self._key, image)
 
 
 class PageCache:
@@ -184,6 +192,10 @@ class RenderEngine(QObject):
         super().__init__(parent)
         self.document = document
         self.cache = PageCache()
+        self.signals = _RenderSignals(self)
+        self.signals.done.connect(self._on_done, Qt.QueuedConnection)
+        self.signals.failed.connect(self._on_failed, Qt.QueuedConnection)
+        self.signals.aborted.connect(self._on_aborted, Qt.QueuedConnection)
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(max(2, min(4, QThreadPool.globalInstance().maxThreadCount())))
         self._pending: Dict[CacheKey, int] = {}
@@ -225,17 +237,11 @@ class RenderEngine(QObject):
         if key in self._pending:
             return None
         self._pending[key] = self._generation
-        task = RenderTask(self, key, self._generation)
-        task.signals.done.connect(self._on_done, Qt.QueuedConnection)
-        task.signals.failed.connect(self._on_failed, Qt.QueuedConnection)
-        self._pool.start(task)
+        self._pool.start(RenderTask(self, key, self._generation))
         return None
 
     def prune(self, keys: Set[CacheKey]) -> None:
         self.cache.keep_only(keys)
-
-    def task_finished(self, key: CacheKey) -> None:
-        self._pending.pop(key, None)
 
     # --------------------------------------------------------------- ranuras
 
@@ -252,6 +258,9 @@ class RenderEngine(QObject):
     def _on_failed(self, key: CacheKey, message: str) -> None:
         self._pending.pop(key, None)
         self.render_failed.emit(key[0], message)
+
+    def _on_aborted(self, key: CacheKey) -> None:
+        self._pending.pop(key, None)
 
     # ---------------------------------------------------------------- cierre
 
