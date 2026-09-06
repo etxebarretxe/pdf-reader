@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from typing import List, Optional
 
-from PySide6.QtCore import QEvent, QSettings, Qt, QThreadPool, QTimer
+from PySide6.QtCore import QEvent, Qt, QThreadPool, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from core import annotations
 from core.document import DocumentError, PdfDocument
+from core.recent_files import Settings
 from core.search import SearchController
 from ui import theme
 from ui.search_bar import SearchBar
@@ -41,8 +42,35 @@ from ui.viewer_widget import (
 
 APP_NAME = "Lector PDF"
 
+SHORTCUTS_HELP = """<b>Archivo</b><br>
+Ctrl+O abrir &nbsp;|&nbsp; Ctrl+Mayus+O abrir en ventana nueva &nbsp;|&nbsp; Ctrl+S guardar anotaciones<br><br>
+<b>Navegacion</b><br>
+PgUp / PgDn / Espacio avanzar &nbsp;|&nbsp; Inicio / Fin primera y ultima pagina<br>
+Ctrl+G ir a pagina &nbsp;|&nbsp; F4 miniaturas<br><br>
+<b>Vista</b><br>
+Ctrl++ / Ctrl+- zoom &nbsp;|&nbsp; Ctrl+0 al 100% &nbsp;|&nbsp; Ctrl+1 ajustar al ancho<br>
+Ctrl+2 ajustar a la pagina &nbsp;|&nbsp; Ctrl+rueda zoom con el raton<br>
+Ctrl+Mayus+Izq / Der girar &nbsp;|&nbsp; Ctrl+D tema claro / oscuro<br>
+Boton central del raton: desplazar arrastrando<br><br>
+<b>Busqueda</b><br>
+Ctrl+F buscar &nbsp;|&nbsp; F3 / Mayus+F3 siguiente y anterior &nbsp;|&nbsp; Esc cerrar<br><br>
+<b>Anotaciones</b><br>
+Arrastrar para seleccionar texto (doble clic selecciona una palabra)<br>
+H resaltar &nbsp;|&nbsp; U subrayar &nbsp;|&nbsp; T tachar &nbsp;|&nbsp; N nota adhesiva<br>
+Ctrl+C copiar &nbsp;|&nbsp; boton derecho: menu contextual"""
+
 #: Ventanas abiertas (evita que el recolector de basura las destruya).
 _WINDOWS: List["MainWindow"] = []
+
+#: Configuracion compartida por todas las ventanas del proceso.
+_SETTINGS: Optional[Settings] = None
+
+
+def get_settings() -> Settings:
+    global _SETTINGS
+    if _SETTINGS is None:
+        _SETTINGS = Settings()
+    return _SETTINGS
 
 
 def open_document_window(path: str, sibling: Optional["MainWindow"] = None) -> Optional["MainWindow"]:
@@ -68,10 +96,11 @@ class MainWindow(QMainWindow):
         self.resize(1100, 820)
 
         self.document: Optional[PdfDocument] = None
-        self.settings = QSettings("LectorPDF", "LectorPDF")
-        self.theme_name = theme_name or self.settings.value("theme", theme.LIGHT)
+        self.settings = get_settings()
+        self.theme_name = theme_name or self.settings.get("theme", theme.LIGHT)
         if self.theme_name not in (theme.LIGHT, theme.DARK):
             self.theme_name = theme.LIGHT
+        self._restore_geometry()
 
         self.viewer = ViewerWidget(self)
         self.setCentralWidget(self.viewer)
@@ -175,6 +204,7 @@ class MainWindow(QMainWindow):
             "Guardar anotaciones", None, QKeySequence.Save, "Guardar las anotaciones en el PDF (Ctrl+S)"
         )
         self.action_copy = self._act("Copiar texto seleccionado", None, QKeySequence.Copy)
+        self.action_shortcuts = self._act("Atajos de teclado", None, "F1")
         self.annotation_actions = [
             self.action_highlight, self.action_underline,
             self.action_strikeout, self.action_note,
@@ -190,6 +220,8 @@ class MainWindow(QMainWindow):
         file_menu = menubar.addMenu("&Archivo")
         file_menu.addAction(self.action_open)
         file_menu.addAction(self.action_open_window)
+        self.menu_recent = file_menu.addMenu("Documentos &recientes")
+        self.menu_recent.aboutToShow.connect(self._fill_recent_menu)
         file_menu.addSeparator()
         file_menu.addAction(self.action_close)
         file_menu.addAction(self.action_quit)
@@ -239,6 +271,9 @@ class MainWindow(QMainWindow):
         self.menu_search.addAction(self.action_find_next)
         self.menu_search.addAction(self.action_find_prev)
 
+        help_menu = menubar.addMenu("A&yuda")
+        help_menu.addAction(self.action_shortcuts)
+
     def _create_statusbar(self) -> None:
         self.status_page = QLabel("", self)
         self.status_zoom = QLabel("", self)
@@ -272,6 +307,7 @@ class MainWindow(QMainWindow):
         self.action_continuous.triggered.connect(lambda: self.set_view_mode(VIEW_CONTINUOUS))
         self.action_single.triggered.connect(lambda: self.set_view_mode(VIEW_SINGLE))
         self.action_theme.triggered.connect(self.toggle_theme)
+        self.action_shortcuts.triggered.connect(self.on_shortcuts)
 
         self.action_highlight.triggered.connect(
             lambda: self.annotate(annotations.HIGHLIGHT))
@@ -361,11 +397,15 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "Archivo de solo lectura: no se podran guardar anotaciones", 6000
             )
-        self.on_page_changed(0)
+        self._restore_document_state(document.path)
+        self.settings.add_recent(document.path)
+        self.settings.save()
+        self.on_page_changed(self.viewer.current_page())
         self.on_zoom_changed(self.viewer.zoom)
         return True
 
     def _release_document(self) -> None:
+        self._remember_document()
         self._save_timer.stop()
         self.search.cancel()
         self._current_match = None
@@ -578,7 +618,7 @@ class MainWindow(QMainWindow):
 
     @property
     def author_name(self) -> str:
-        return str(self.settings.value("author", "")) or ""
+        return str(self.settings.get("author", "") or "")
 
     def mark_dirty(self) -> None:
         self._dirty = True
@@ -751,6 +791,97 @@ class MainWindow(QMainWindow):
         self.viewer.clear_search()
         self.viewer.setFocus()
 
+    def on_shortcuts(self) -> None:
+        QMessageBox.information(self, "Atajos de teclado", SHORTCUTS_HELP)
+
+    # --------------------------------------------------- recientes y estado
+
+    def _fill_recent_menu(self) -> None:
+        self.menu_recent.clear()
+        self.settings.prune_missing()
+        entries = self.settings.recent_files()
+        if not entries:
+            empty = self.menu_recent.addAction("(vacio)")
+            empty.setEnabled(False)
+            return
+        for position, entry in enumerate(entries, start=1):
+            path = entry["path"]
+            label = f"&{position}  {entry.get('name', os.path.basename(path))}"
+            action = self.menu_recent.addAction(label)
+            action.setStatusTip(path)
+            action.triggered.connect(lambda _checked=False, p=path: self._open_recent(p))
+        self.menu_recent.addSeparator()
+        clear = self.menu_recent.addAction("Vaciar la lista")
+        clear.triggered.connect(self._clear_recent)
+
+    def _open_recent(self, path: str) -> None:
+        if not os.path.exists(path):
+            QMessageBox.information(self, APP_NAME, "El archivo ya no existe:\n" + path)
+            self.settings.remove_recent(path)
+            self.settings.save()
+            return
+        if self.document is None:
+            self.open_path(path)
+        else:
+            open_document_window(path, sibling=self)
+
+    def _clear_recent(self) -> None:
+        self.settings.clear_recent()
+        self.settings.save()
+
+    def _current_document_state(self) -> dict:
+        return {
+            "page": self.viewer.current_page(),
+            "zoom": round(self.viewer.zoom, 4),
+            "zoom_mode": self.viewer.zoom_mode,
+            "rotation": self.viewer.rotation,
+            "view_mode": self.viewer.view_mode,
+        }
+
+    def _remember_document(self) -> None:
+        """Guarda la posicion de lectura del documento actual."""
+        if self.document is None:
+            return
+        self.settings.add_recent(self.document.path)
+        self.settings.remember_document(self.document.path, self._current_document_state())
+        self.settings.save()
+
+    def _restore_document_state(self, path: str) -> None:
+        """Reabre el documento donde se dejo (pagina, zoom, giro, modo)."""
+        state = self.settings.document_state(path)
+        if not state:
+            return
+        rotation = int(state.get("rotation", 0)) % 360
+        if rotation:
+            self.viewer.rotation = rotation
+        view_mode = state.get("view_mode")
+        if view_mode in (VIEW_CONTINUOUS, VIEW_SINGLE):
+            self.set_view_mode(view_mode)
+        zoom_mode = state.get("zoom_mode", ZOOM_FIT_WIDTH)
+        if zoom_mode == ZOOM_FREE:
+            self.viewer.set_zoom(float(state.get("zoom", 1.0)), ZOOM_FREE)
+        else:
+            self.viewer.set_zoom_mode(zoom_mode)
+        page = int(state.get("page", 0))
+        if page:
+            self.viewer.goto_page(page)
+
+    def _restore_geometry(self) -> None:
+        window = self.settings.get("window", {}) or {}
+        width, height = window.get("width"), window.get("height")
+        if isinstance(width, int) and isinstance(height, int) and width > 400 and height > 300:
+            self.resize(width, height)
+        if window.get("maximized"):
+            self.showMaximized()
+
+    def _remember_geometry(self) -> None:
+        size = self.normalGeometry().size()
+        self.settings.set("window", {
+            "width": size.width(),
+            "height": size.height(),
+            "maximized": self.isMaximized(),
+        })
+
     # ------------------------------------------------------------------- tema
 
     def toggle_theme(self) -> None:
@@ -758,7 +889,8 @@ class MainWindow(QMainWindow):
 
     def apply_theme(self, name: str) -> None:
         self.theme_name = name
-        self.settings.setValue("theme", name)
+        self.settings.set("theme", name)
+        self.settings.save()
         self.setStyleSheet(theme.stylesheet(name))
         self.viewer.apply_theme(name)
         self.search_bar.apply_theme(name)
@@ -793,12 +925,17 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------------- cierre
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._remember_geometry()
+        # Se anota la posicion de lectura antes de guardar: un guardado
+        # completo cierra y sustituye el documento.
+        self._remember_document()
         self._save_timer.stop()
         self.save_pool.waitForDone(5000)
         self._save_before_close()
         self.search.shutdown()
         self.thumbnails.shutdown()
         self._release_document()
+        self.settings.save()
         if self in _WINDOWS:
             _WINDOWS.remove(self)
         super().closeEvent(event)

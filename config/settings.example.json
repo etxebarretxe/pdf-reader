@@ -1,0 +1,8 @@
+{
+  "_comentario": "Copia este archivo como config/settings.json para activar el modo portable (la configuracion se guarda junto al programa en lugar de en %APPDATA%\\LectorPDF).",
+  "theme": "light",
+  "author": "",
+  "window": { "width": 1100, "height": 820, "maximized": false },
+  "recent": [],
+  "documents": {}
+}
