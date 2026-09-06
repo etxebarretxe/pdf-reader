@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from typing import List, Optional
 
-from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtCore import QEvent, QSettings, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -23,7 +23,9 @@ from PySide6.QtWidgets import (
 )
 
 from core.document import DocumentError, PdfDocument
+from core.search import SearchController
 from ui import theme
+from ui.search_bar import SearchBar
 from ui.thumbnail_panel import ThumbnailPanel
 from ui.toolbar import build_toolbar
 from ui.viewer_widget import (
@@ -80,6 +82,12 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.LeftDockWidgetArea, self.thumb_dock)
         self.thumb_dock.hide()
 
+        self.search = SearchController(self)
+        self.search_bar = SearchBar(self.viewer)
+        self._current_match = None
+        self._searching = False
+        self.viewer.installEventFilter(self)
+
         self._create_actions()
         self.addToolBar(build_toolbar(self))
         self._create_menus()
@@ -135,6 +143,8 @@ class MainWindow(QMainWindow):
         self.action_single.setCheckable(True)
 
         self.action_search = self._act("Buscar", "search", QKeySequence.Find, "Buscar en el documento (Ctrl+F)")
+        self.action_find_next = self._act("Buscar siguiente", None, QKeySequence.FindNext)
+        self.action_find_prev = self._act("Buscar anterior", None, QKeySequence.FindPrevious)
         self.action_theme = self._act("Tema claro / oscuro", "theme", "Ctrl+D", "Cambiar tema (Ctrl+D)")
 
     def _create_menus(self) -> None:
@@ -172,6 +182,8 @@ class MainWindow(QMainWindow):
 
         self.menu_search = menubar.addMenu("&Buscar")
         self.menu_search.addAction(self.action_search)
+        self.menu_search.addAction(self.action_find_next)
+        self.menu_search.addAction(self.action_find_prev)
 
     def _create_statusbar(self) -> None:
         self.status_page = QLabel("", self)
@@ -206,6 +218,16 @@ class MainWindow(QMainWindow):
         self.action_continuous.triggered.connect(lambda: self.set_view_mode(VIEW_CONTINUOUS))
         self.action_single.triggered.connect(lambda: self.set_view_mode(VIEW_SINGLE))
         self.action_theme.triggered.connect(self.toggle_theme)
+
+        self.action_search.triggered.connect(self.on_search)
+        self.action_find_next.triggered.connect(self.on_find_next)
+        self.action_find_prev.triggered.connect(self.on_find_previous)
+        self.search_bar.search_requested.connect(self.on_search_term)
+        self.search_bar.next_requested.connect(self.on_find_next)
+        self.search_bar.previous_requested.connect(self.on_find_previous)
+        self.search_bar.closed.connect(self.on_search_closed)
+        self.search.matches_updated.connect(self.on_matches_updated)
+        self.search.finished.connect(self.on_search_finished)
 
         self.viewer.page_changed.connect(self.on_page_changed)
         self.viewer.zoom_changed.connect(self.on_zoom_changed)
@@ -270,6 +292,9 @@ class MainWindow(QMainWindow):
         return True
 
     def _release_document(self) -> None:
+        self.search.cancel()
+        self._current_match = None
+        self.search_bar.hide()
         self.thumbnails.set_document(None)
         self.viewer.close_document()
         if self.document is not None:
@@ -284,6 +309,7 @@ class MainWindow(QMainWindow):
             self.action_zoom_reset, self.action_fit_width, self.action_fit_page,
             self.action_rotate_left, self.action_rotate_right, self.action_search,
             self.action_thumbnails, self.action_continuous, self.action_single,
+            self.action_find_next, self.action_find_prev,
         ):
             action.setEnabled(has_doc)
         for action in getattr(self, "annotation_actions", []):
@@ -348,6 +374,96 @@ class MainWindow(QMainWindow):
         if ok:
             self.viewer.goto_page(value - 1)
 
+    # --------------------------------------------------------------- busqueda
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self.viewer and event.type() == QEvent.Resize:
+            self._place_search_bar()
+        return super().eventFilter(obj, event)
+
+    def _place_search_bar(self) -> None:
+        bar = self.search_bar
+        bar.adjustSize()
+        bar.move(max(8, self.viewer.width() - bar.width() - 22), 10)
+
+    def on_search(self) -> None:
+        if self.document is None:
+            return
+        selected = self.viewer.selection.text if self.viewer.has_selection() else ""
+        self._place_search_bar()
+        self.search_bar.show_bar(selected[:120])
+        if selected:
+            self.on_search_term(selected[:120])
+
+    def on_search_term(self, term: str) -> None:
+        if self.document is None:
+            return
+        self._current_match = None
+        self.viewer.clear_search()
+        term = term.strip()
+        if not term:
+            self.search.cancel()
+            self._searching = False
+            self.search_bar.set_counter(0, 0)
+            return
+        self._searching = True
+        self.search_bar.set_counter(0, 0, searching=True)
+        self.search.start(
+            self.document.path, term, self.document.page_count, self.viewer.current_page()
+        )
+
+    def on_matches_updated(self, matches) -> None:
+        # Resaltado progresivo: se pintan las coincidencias segun llegan.
+        self.viewer.set_search_matches({page: list(rects) for page, rects in matches.items()})
+        if self._current_match is None:
+            first = self.search.first_from(self.viewer.current_page())
+            if first is not None:
+                self._select_match(first)
+        self._update_search_counter()
+
+    def on_search_finished(self, total: int) -> None:
+        self._searching = False
+        self._update_search_counter()
+        if total == 0 and self.search_bar.term().strip():
+            self.statusBar().showMessage(
+                f"Sin coincidencias para \u00ab{self.search_bar.term()}\u00bb", 4000
+            )
+
+    def _update_search_counter(self) -> None:
+        total = self.search.count()
+        position = 0
+        if self._current_match is not None:
+            position = self.search.index_of(*self._current_match) + 1
+        self.search_bar.set_counter(position, total, self._searching)
+
+    def _select_match(self, match) -> None:
+        self._current_match = match
+        self.viewer.set_current_match(match[0], match[1])
+        self._update_search_counter()
+
+    def on_find_next(self) -> None:
+        if self.search.count() == 0:
+            return
+        reference = self._current_match or (self.viewer.current_page() - 1, 1 << 30)
+        match = self.search.next_after(*reference)
+        if match is not None:
+            self._select_match(match)
+
+    def on_find_previous(self) -> None:
+        if self.search.count() == 0:
+            return
+        reference = self._current_match or (self.viewer.current_page(), 0)
+        match = self.search.previous_before(*reference)
+        if match is not None:
+            self._select_match(match)
+
+    def on_search_closed(self) -> None:
+        self.search.cancel()
+        self._searching = False
+        self._current_match = None
+        self.viewer.clear_search()
+        self.viewer.setFocus()
+
     # ------------------------------------------------------------------- tema
 
     def toggle_theme(self) -> None:
@@ -358,6 +474,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("theme", name)
         self.setStyleSheet(theme.stylesheet(name))
         self.viewer.apply_theme(name)
+        self.search_bar.apply_theme(name)
         for action in self.findChildren(QAction):
             icon_name = action.property("icon_name")
             if icon_name:
@@ -389,6 +506,7 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------------- cierre
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self.search.shutdown()
         self.thumbnails.shutdown()
         self._release_document()
         if self in _WINDOWS:

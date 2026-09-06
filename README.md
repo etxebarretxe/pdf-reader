@@ -11,6 +11,10 @@ incluye lo que se usa (ver, navegar, buscar, anotar).
   zoom (libre, ajustar a ancho, ajustar a pagina), rotacion de vista,
   navegacion, panel de miniaturas, tema claro/oscuro, arrastrar y soltar,
   multiventana.
+- **Fase 2 — Busqueda (completa):** busqueda de texto en todo el documento en
+  hilo secundario (la UI nunca se bloquea), resaltado progresivo de todas las
+  coincidencias, navegacion entre resultados con contador "3 de 27" y
+  cancelacion inmediata al reescribir el termino.
 
 ## Requisitos
 
@@ -37,6 +41,9 @@ python main.py documento.pdf   # abre un documento
 | `Ctrl+Shift+Izq/Der` | Rotar la vista |
 | `PgUp` / `PgDn` / `Espacio` | Navegar |
 | `Ctrl+Inicio` / `Ctrl+Fin` | Primera / ultima pagina |
+| `Ctrl+F` | Buscar |
+| `F3` / `Mayus+F3` | Coincidencia siguiente / anterior |
+| `Esc` | Cerrar la busqueda |
 | `F4` | Panel de miniaturas |
 | `Ctrl+D` | Tema claro / oscuro |
 | `Ctrl+rueda` | Zoom con el raton |
