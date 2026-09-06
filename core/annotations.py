@@ -11,7 +11,7 @@ secundario para no bloquear la interfaz.
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 from PySide6.QtCore import QObject, QRunnable, Signal
 
